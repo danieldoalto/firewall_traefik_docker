@@ -1,0 +1,13 @@
+# Arquivos de Log e Backup
+fw.log
+iptables.backup
+.fw-last-rules.log
+
+# Cache do Python
+__pycache__/
+*.pyc
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
