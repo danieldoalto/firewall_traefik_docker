@@ -1,19 +1,28 @@
 # Lista de IPs ou ranges (formato CIDR) que sempre terão acesso permitido.
-# Estas regras são aplicadas com prioridade máxima.
+# Estas regras são aplicadas com prioridade máxima através de uma chain dedicada.
 whitelist_ips:
   - 192.168.1.100
   - 10.0.0.0/24
 
+# Portas essenciais que NUNCA devem ser bloqueadas pelo script.
+never_block_ports:
+  - 22  # SSH
+  - 80  # HTTP
+  - 443 # HTTPS
+
 # Lista de portas a serem gerenciadas pelo script.
-# O script ignora as portas de exceção (22, 80, 443, 8080).
 # - 'sudo python3 fw.py' -> BLOQUEIA estas portas.
-# - 'sudo python3 fw.py -n' -> LIBERA estas portas para acesso externo.
+# - 'sudo python3 fw.py -l' -> LIBERA estas portas para acesso externo.
 managed_ports:
   - 3000
   - 3001
   - 5000
   - 5432
+  - 5678
+  - 8081
   - 9000
+  - 9443
+  - 10000
   - 10000
   - 9443
   - 3000

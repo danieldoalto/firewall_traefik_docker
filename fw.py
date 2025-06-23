@@ -8,9 +8,9 @@ import os
 CONFIG_FILE = 'config.yml'
 LOG_FILE = 'fw.log'
 BACKUP_FILE = 'iptables.backup'
-LAST_RULES_FILE = '.fw-last-rules.log'  # Arquivo para guardar as últimas regras aplicadas
-RULE_COMMENT = 'managed-by-fw-script'  # Comentário para identificar nossas regras
-EXEMPT_PORTS = {'22', '80', '443', '8080'}  # Portas que nunca serão gerenciadas
+LAST_RULES_FILE = '.fw-last-rules.log'
+RULE_COMMENT = 'managed-by-fw-script'
+WHITELIST_CHAIN = 'whitelist'
 
 # --- Configuração do Logging ---
 logging.basicConfig(
@@ -23,8 +23,9 @@ logging.basicConfig(
 )
 
 def run_command(command, stdin_file=None):
-    """Executa um comando no shell, com opção de redirecionar stdin de um arquivo."""
-    logging.info(f"Executando comando: {' '.join(command)}")
+    """Executa um comando no shell e lida com erros."""
+    # A junção é apenas para o log, o comando é executado como uma lista
+    logging.info(f"Executando: {' '.join(command)}")
     try:
         result = subprocess.run(
             command,
@@ -37,33 +38,30 @@ def run_command(command, stdin_file=None):
             logging.info(f"Saída: {result.stdout.strip()}")
         return result
     except subprocess.CalledProcessError as e:
-        logging.error(f"Erro ao executar comando: {' '.join(command)}")
+        logging.error(f"Erro ao executar: {' '.join(command)}")
         logging.error(f"Stderr: {e.stderr.strip()}")
         if 'Permission denied' in e.stderr:
-            logging.error("Dica: O script precisa ser executado com privilégios de root (use 'sudo').")
+            logging.error("Dica: Execute o script com 'sudo'.")
         sys.exit(1)
     except FileNotFoundError:
-        logging.error(f"Erro: 'iptables' não encontrado. Verifique se está instalado e no PATH.")
+        logging.error(f"Erro: 'iptables' não encontrado. Verifique se está instalado.")
         sys.exit(1)
 
 def record_rule(command):
-    """Grava um comando de regra no arquivo de log de regras."""
+    """Grava um comando de regra no arquivo de log para remoção posterior."""
     with open(LAST_RULES_FILE, 'a') as f:
         f.write(' '.join(command) + '\n')
 
 def clear_last_rules_file():
-    """Limpa o arquivo de log de regras."""
+    """Limpa o arquivo de log de regras da execução anterior."""
     if os.path.exists(LAST_RULES_FILE):
         os.remove(LAST_RULES_FILE)
-    logging.info(f"Arquivo de regras '{LAST_RULES_FILE}' foi limpo.")
 
 def load_config():
-    """Carrega a configuração completa do arquivo config.yml."""
+    """Carrega a configuração do arquivo config.yml."""
     try:
         with open(CONFIG_FILE, 'r') as f:
-            config = yaml.safe_load(f)
-            logging.info(f"Configuração carregada de {CONFIG_FILE}")
-            return config
+            return yaml.safe_load(f) or {}
     except FileNotFoundError:
         logging.error(f"Arquivo de configuração '{CONFIG_FILE}' não encontrado.")
         return {}
@@ -71,9 +69,46 @@ def load_config():
         logging.error(f"Erro ao ler o arquivo YAML '{CONFIG_FILE}': {e}")
         return {}
 
-def flush_rules():
-    """Remove as regras aplicadas na última execução, lendo do arquivo de log."""
-    logging.info(f"--- Iniciando remoção de regras a partir de {LAST_RULES_FILE} ---")
+def get_existing_rules(chain):
+    """Retorna uma lista de regras existentes para uma dada chain."""
+    try:
+        result = subprocess.run(['sudo', 'iptables', '-S', chain], check=True, capture_output=True, text=True)
+        return result.stdout.strip().split('\n')
+    except subprocess.CalledProcessError:
+        return []
+
+def setup_base_firewall():
+    """Garante que a estrutura base do firewall (chain de whitelist e saltos) está configurada."""
+    logging.info("--- Verificando e configurando a estrutura base do firewall ---")
+    
+    # 1. Criar a chain 'whitelist' se não existir
+    try:
+        subprocess.run(['sudo', 'iptables', '-L', WHITELIST_CHAIN], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        logging.info(f"Chain '{WHITELIST_CHAIN}' não encontrada. Criando...")
+        run_command(['sudo', 'iptables', '-N', WHITELIST_CHAIN])
+
+    # 2. Garantir que o salto para a whitelist está no topo de INPUT e FORWARD
+    for chain in ['INPUT', 'FORWARD']:
+        rules = get_existing_rules(chain)
+        jump_rule = f'-A {chain} -j {WHITELIST_CHAIN}' # O formato de -S é -A
+        if not rules or not any(f'-j {WHITELIST_CHAIN}' in r for r in rules):
+            logging.info(f"Inserindo salto para '{WHITELIST_CHAIN}' no topo da chain '{chain}'...")
+            run_command(['sudo', 'iptables', '-I', chain, '1', '-j', WHITELIST_CHAIN])
+
+    # 3. Popular a chain de whitelist
+    logging.info(f"Atualizando regras da chain '{WHITELIST_CHAIN}'...")
+    config = load_config()
+    whitelist_ips = config.get('whitelist_ips', [])
+    run_command(['sudo', 'iptables', '-F', WHITELIST_CHAIN]) # Limpa para garantir estado fresco
+    
+    if whitelist_ips:
+        for ip in whitelist_ips:
+            run_command(['sudo', 'iptables', '-A', WHITELIST_CHAIN, '-s', ip, '-j', 'ACCEPT'])
+
+def flush_last_run_rules():
+    """Remove as regras de portas gerenciadas da última execução."""
+    logging.info(f"--- Removendo regras da última execução a partir de {LAST_RULES_FILE} ---")
     if not os.path.exists(LAST_RULES_FILE):
         logging.warning(f"Arquivo '{LAST_RULES_FILE}' não encontrado. Nenhuma regra para remover.")
         return
@@ -81,17 +116,12 @@ def flush_rules():
     with open(LAST_RULES_FILE, 'r') as f:
         rules = f.readlines()
         for rule_str in reversed(rules):
-            rule_str = rule_str.strip()
-            if not rule_str:
-                continue
-            
-            # Converte 'iptables -A/I ...' para 'iptables -D ...'
-            delete_command = rule_str.replace(' -A ', ' -D ').replace(' -I ', ' -D ').split()
-            # Remove o '1' de regras de inserção (-I CHAIN 1) para a deleção
-            if len(delete_command) > 3 and delete_command[2] in ['INPUT', 'FORWARD'] and delete_command[3] == '1':
+            if not rule_str.strip(): continue
+            # Converte o comando de inserção/adição para um de deleção
+            delete_command = rule_str.strip().replace(' -I ', ' -D ').replace(' -A ', ' -D ').split()
+            # Remove o número da linha para o comando de deleção se for o caso
+            if delete_command[3].isdigit():
                 del delete_command[3]
-
-            logging.info(f"Removendo regra: {' '.join(delete_command)}")
             run_command(delete_command)
     
     clear_last_rules_file()
@@ -100,52 +130,39 @@ def flush_rules():
 def manage_ports(action):
     """Aplica regras de ACCEPT ou DROP para as portas gerenciadas."""
     logging.info(f"--- Iniciando '{action}' para as portas gerenciadas ---")
+    flush_last_run_rules()
     
-    flush_rules() # Limpa regras antigas antes de aplicar novas
-
     config = load_config()
     managed_ports = config.get('managed_ports', [])
-    whitelist_ips = config.get('whitelist_ips', [])
+    never_block_ports = {str(p) for p in config.get('never_block_ports', [])}
     iptables_action = 'ACCEPT' if action == 'open' else 'DROP'
 
-    # 1. Aplicar whitelist com prioridade
-    if whitelist_ips:
-        logging.info("--- Aplicando regras de whitelist ---")
-        for ip in whitelist_ips:
-            logging.info(f"Permitindo acesso total para o IP/range: {ip}")
-            rule_input = ['sudo', 'iptables', '-I', 'INPUT', '1', '-s', ip, '-m', 'comment', '--comment', RULE_COMMENT, '-j', 'ACCEPT']
-            run_command(rule_input)
-            record_rule(rule_input)
-
-    # 2. Aplicar regras para as portas gerenciadas
     if not managed_ports:
         logging.warning("Nenhuma porta gerenciada encontrada em config.yml.")
         return
 
     logging.info(f"--- Aplicando regras de '{iptables_action}' para as portas ---")
-    for port in managed_ports:
+    for port in sorted(list(set(managed_ports)), reverse=True):
         port_str = str(port)
-        if port_str in EXEMPT_PORTS:
-            logging.info(f"Ignorando porta de exceção: {port_str}")
+        if port_str in never_block_ports:
+            logging.info(f"Ignorando porta da lista 'never_block_ports': {port_str}")
             continue
 
-        logging.info(f"Aplicando regra '{iptables_action}' para a porta {port_str}")
-        rule_input = ['sudo', 'iptables', '-A', 'INPUT', '-p', 'tcp', '--dport', port_str, '-m', 'comment', '--comment', RULE_COMMENT, '-j', iptables_action]
-        run_command(rule_input)
-        record_rule(rule_input)
-        rule_forward = ['sudo', 'iptables', '-A', 'FORWARD', '-p', 'tcp', '--dport', port_str, '-m', 'comment', '--comment', RULE_COMMENT, '-j', iptables_action]
-        run_command(rule_forward)
-        record_rule(rule_forward)
+        for chain in ['INPUT', 'FORWARD']:
+            # Inserir na posição 2, logo após o salto para a whitelist
+            rule = ['sudo', 'iptables', '-I', chain, '2', '-p', 'tcp', '--dport', port_str, '-m', 'comment', '--comment', RULE_COMMENT, '-j', iptables_action]
+            run_command(rule)
+            record_rule(rule)
     
     logging.info(f"Regras de '{action}' aplicadas com sucesso.")
 
 def backup_rules():
     """Salva as regras atuais do iptables em um arquivo."""
-    logging.info(f"--- Iniciando backup das regras para {BACKUP_FILE} ---")
+    logging.info(f"--- Fazendo backup das regras para {BACKUP_FILE} ---")
     try:
         with open(BACKUP_FILE, 'w') as f:
             subprocess.run(['sudo', 'iptables-save'], check=True, text=True, stdout=f)
-        logging.info(f"Backup das regras do iptables salvo em '{BACKUP_FILE}'.")
+        logging.info(f"Backup salvo em '{BACKUP_FILE}'.")
     except Exception as e:
         logging.error(f"Falha ao criar backup: {e}")
 
@@ -164,20 +181,22 @@ def restore_rules():
 
 def main():
     """Função principal que processa os argumentos da linha de comando."""
+    setup_base_firewall()
+
     if len(sys.argv) == 1:
         manage_ports('block')
-    elif sys.argv[1] == '-n':
+    elif sys.argv[1] == '-l':
         manage_ports('open')
     elif sys.argv[1] == '-f':
-        flush_rules()
+        flush_last_run_rules()
     elif sys.argv[1] == '-b':
         backup_rules()
     elif sys.argv[1] == '-r':
         restore_rules()
     else:
-        print("Uso: python3 fw.py [-n | -f | -b | -r]")
+        print("Uso: python3 fw.py [-l | -f | -b | -r]")
         print("  (sem argumento): Bloqueia as portas do config.yml")
-        print("  -n: Libera as portas do config.yml para acesso externo")
+        print("  -l: Libera as portas do config.yml para acesso externo")
         print("  -f: Remove as regras aplicadas pelo script na última execução")
         print("  -b: Cria um backup das regras atuais do iptables")
         print("  -r: Restaura as regras a partir do backup")
